@@ -6,9 +6,10 @@ from fastapi import FastAPI, UploadFile, File
 
 SERVER = "https://onetap-1opu-production.up.railway.app"
 GAME = os.environ.get("GAME", "pokemon")   # which game this service handles
-VEC_FILE = f"{GAME}_vectors.npy"
-META_FILE = f"{GAME}_meta.json"
-PROGRESS = f"{GAME}_progress.json"
+   DATA_DIR = "/data"
+   VEC_FILE = f"{DATA_DIR}/{GAME}_vectors.npy"
+   META_FILE = f"{DATA_DIR}/{GAME}_meta.json"
+   PROGRESS = f"{DATA_DIR}/{GAME}_progress.json"
 
 print("Loading CLIP (CPU)...")
 model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
