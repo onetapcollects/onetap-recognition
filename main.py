@@ -1,4 +1,4 @@
-import os, io, json, urllib.request
+import os, io, json, urllib.request, requests
 import numpy as np
 import torch, open_clip
 from PIL import Image
