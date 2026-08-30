@@ -30,9 +30,11 @@ def ensure_file(stem, ext):
         return path
     url = f"{RELEASE}/{fname}"
     print(f"Downloading {fname} ...")
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
-        f.write(r.read())
+    with requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=300, stream=True) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
     print(f"  saved {fname} ({os.path.getsize(path)} bytes)")
     return path
 
