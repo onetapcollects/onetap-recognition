@@ -2,18 +2,59 @@ import os, io, json, urllib.request
 import numpy as np
 import torch, open_clip
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 
-SERVER = "https://onetap-1opu-production.up.railway.app"
-GAME = os.environ.get("GAME", "pokemon")   # which game this service handles
+# All five games in one service. CLIP loads once; each game's index loads into memory.
+# A scan says which game it is, and we search ONLY that game's index (no cross-game misreads).
+
 DATA_DIR = "/data"
-VEC_FILE = f"{DATA_DIR}/{GAME}_vectors.npy"
-META_FILE = f"{DATA_DIR}/{GAME}_meta.json"
-PROGRESS = f"{DATA_DIR}/{GAME}_progress.json"
+RELEASE = "https://github.com/onetapcollects/onetap-recognition/releases/download/indexes"
+
+# App sends these cardType names. Map each to its index file stem.
+# NOTE: app sends "one_piece" (underscore) but the files are "onepiece" (no underscore).
+GAME_FILES = {
+    "pokemon":   "pokemon",
+    "magic":     "magic",
+    "yugioh":    "yugioh",
+    "one_piece": "onepiece",
+    "lorcana":   "lorcana",
+}
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def ensure_file(stem, ext):
+    """Download <stem>_<ext> from the GitHub Release into /data if not already there."""
+    fname = f"{stem}_{ext}"
+    path = os.path.join(DATA_DIR, fname)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    url = f"{RELEASE}/{fname}"
+    print(f"Downloading {fname} ...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
+        f.write(r.read())
+    print(f"  saved {fname} ({os.path.getsize(path)} bytes)")
+    return path
 
 print("Loading CLIP (CPU)...")
 model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
 model = model.to("cpu").eval()
+
+# Load every game: download its two files, then read them into memory.
+INDEX = {}  # cardType -> {"vectors": np.array, "meta": list}
+for cardType, stem in GAME_FILES.items():
+    try:
+        vec_path = ensure_file(stem, "vectors.npy")
+        meta_path = ensure_file(stem, "meta.json")
+        vectors = np.load(vec_path)
+        meta = json.load(open(meta_path, encoding="utf-8"))
+        INDEX[cardType] = {"vectors": vectors, "meta": meta}
+        print(f"Loaded {cardType}: {len(meta)} cards.")
+    except Exception as e:
+        print(f"FAILED to load {cardType}: {e}")
+
+total = sum(len(v["meta"]) for v in INDEX.values())
+print(f"Ready: {len(INDEX)} games, {total} cards total.")
 
 def fp(img):
     x = preprocess(img).unsqueeze(0).to("cpu")
@@ -22,70 +63,28 @@ def fp(img):
         v = v / v.norm(dim=-1, keepdim=True)
     return v.cpu().numpy()[0]
 
-def game_tag(setlist):
-    games = set(str(s.get("game","")).lower() for s in setlist)
-    if GAME == "pokemon": return "pokemon"
-    if GAME == "onepiece": return next((g for g in games if "piece" in g), "one_piece")
-    return GAME
-
-def build_index():
-    print(f"Building {GAME} index from server (first boot, this takes a while)...")
-    with urllib.request.urlopen(f"{SERVER}/api/sets") as r:
-        setlist = json.load(r)
-    setlist = setlist.get("sets", setlist) if isinstance(setlist, dict) else setlist
-    tag = game_tag(setlist)
-    sets = [s for s in setlist if str(s.get("game","")).lower() == tag]
-    done = set(json.load(open(PROGRESS))) if os.path.exists(PROGRESS) else set()
-    meta = json.load(open(META_FILE, encoding="utf-8")) if os.path.exists(META_FILE) else []
-    vecs = list(np.load(VEC_FILE)) if os.path.exists(VEC_FILE) else []
-    for s in sets:
-        sid = str(s.get("id"))
-        if sid in done: continue
-        try:
-            with urllib.request.urlopen(f"{SERVER}/api/sets/{sid}/cards", timeout=30) as r:
-                data = json.load(r)
-            cards = data.get("cards", data) if isinstance(data, dict) else data
-            cards = [c for c in cards if c.get("image")]
-        except Exception:
-            continue
-        for c in cards:
-            try:
-                req = urllib.request.Request(c["image"], headers={"User-Agent":"Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    img = Image.open(io.BytesIO(resp.read())).convert("RGB")
-                vecs.append(fp(img))
-                meta.append({"name": c.get("name"), "number": c.get("number"), "set": s.get("name")})
-            except Exception:
-                pass
-        done.add(sid)
-        np.save(VEC_FILE, np.array(vecs))
-        json.dump(meta, open(META_FILE,"w",encoding="utf-8"))
-        json.dump(list(done), open(PROGRESS,"w"))
-        print(f"  {s.get('name')}: total {len(meta)}")
-    return np.array(vecs), meta
-
-if os.path.exists(VEC_FILE) and os.path.exists(META_FILE):
-    print("Loading saved index...")
-    vectors = np.load(VEC_FILE)
-    meta = json.load(open(META_FILE, encoding="utf-8"))
-else:
-    vectors, meta = build_index()
-print(f"Ready: {len(meta)} {GAME} cards indexed.")
-
 app = FastAPI()
 
 @app.get("/")
 def health():
-    return {"status": "ok", "game": GAME, "cards": len(meta)}
+    return {
+        "status": "ok",
+        "games": {g: len(v["meta"]) for g, v in INDEX.items()},
+        "total": total,
+    }
 
 @app.post("/identify")
-async def identify(file: UploadFile = File(...)):
+async def identify(file: UploadFile = File(...), game: str = Form(...)):
+    if game not in INDEX:
+        return {"error": f"unknown game '{game}'", "known": list(INDEX.keys())}
+    data = INDEX[game]
     img = Image.open(io.BytesIO(await file.read())).convert("RGB")
     q = fp(img)
-    sims = vectors @ q
+    sims = data["vectors"] @ q
     order = sims.argsort()[::-1][:5]
-    return {"matches": [
-        {"name": meta[i]["name"], "number": meta[i].get("number"),
-         "set": meta[i].get("set"), "score": float(sims[i])}
+    m = data["meta"]
+    return {"game": game, "matches": [
+        {"name": m[i]["name"], "number": m[i].get("number"),
+         "set": m[i].get("set"), "score": float(sims[i])}
         for i in order
     ]}
