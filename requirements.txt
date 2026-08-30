@@ -1,10 +1,9 @@
-   torch --index-url https://download.pytorch.org/whl/cpu
-   torchvision --index-url https://download.pytorch.org/whl/cpu
-   open_clip_torch
-   pillow
-   numpy
-   fastapi
-   uvicorn
-   fastapi
-   uvicorn
-   python-multipart
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
+open_clip_torch
+pillow
+numpy
+fastapi
+uvicorn
+python-multipart
+requests
