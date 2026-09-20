@@ -8,5 +8,4 @@ uvicorn
 python-multipart
 requests
 imagehash
-collectorvision
 onnxruntime
