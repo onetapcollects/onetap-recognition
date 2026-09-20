@@ -145,6 +145,12 @@ async def identify(file: UploadFile = File(...), game: str = Form(...)):
     if hm and ct<0.75 and hm[0]["score"]>0.80: best=hm[0]
     return {"game":game,"best":best,"clip":clip,"hash":hm}
 
+def _score_pool(q, qn, idxs):
+    embs=FOREIGN["embs"]; norms=FOREIGN["norms"]; meta=FOREIGN["meta"]
+    sims=[(float(np.dot(embs[i].astype(np.float32),q)/(norms[i]*qn)),i) for i in idxs]
+    sims.sort(reverse=True)
+    return [{"name":meta[i].get("name"),"set":meta[i].get("set"),"number":meta[i].get("number"),"score":round(s,4)} for s,i in sims[:5]]
+
 @app.post("/identify_foreign")
 async def identify_foreign(file: UploadFile = File(...), number: str = Form(default="")):
     load_foreign()
@@ -152,17 +158,25 @@ async def identify_foreign(file: UploadFile = File(...), number: str = Form(defa
         return {"best":None,"confident":False,"error":"foreign unavailable"}
     img=Image.open(io.BytesIO(await file.read())).convert("RGB")
     q=_embed_foreign(img); qn=np.linalg.norm(q)+1e-9
+    n=len(FOREIGN["meta"])
+
+    # STAGE 1: narrow by the OCR-read number (works when JP/EN numbers match).
     tgt=_digits(number)
     idxs=FOREIGN["num_index"].get(tgt) if tgt else None
-    narrowed=bool(idxs)
-    if not idxs: idxs=list(range(len(FOREIGN["meta"])))
-    embs=FOREIGN["embs"]; norms=FOREIGN["norms"]; meta=FOREIGN["meta"]
-    sims=[(float(np.dot(embs[i].astype(np.float32),q)/(norms[i]*qn)),i) for i in idxs]
-    sims.sort(reverse=True)
-    top=[{"name":meta[i].get("name"),"set":meta[i].get("set"),"number":meta[i].get("number"),"score":round(s,4)} for s,i in sims[:5]]
+    if idxs:
+        top=_score_pool(q, qn, idxs)
+        best=top[0] if top else None
+        if best:
+            gap=(top[0]["score"]-top[1]["score"]) if len(top)>1 else 0.2
+            if best["score"]>=0.32 and gap>=0.03:
+                return {"best":best,"confident":True,"narrowed":True,"stage":"number","matches":top}
+
+    # STAGE 2: number narrow missed (JP number != EN catalogue number). Full artwork search.
+    # Higher bar since there's no number filter: needs a clear win to be trusted.
+    top=_score_pool(q, qn, list(range(n)))
     best=top[0] if top else None
     conf=False
-    if best and narrowed:
+    if best:
         gap=(top[0]["score"]-top[1]["score"]) if len(top)>1 else 0.2
-        conf = best["score"]>=0.32 and gap>=0.03
-    return {"best":best if conf else None,"confident":conf,"narrowed":narrowed,"matches":top}
+        conf = best["score"]>=0.40 and gap>=0.05
+    return {"best":best if conf else None,"confident":conf,"narrowed":False,"stage":"full","matches":top}
