@@ -87,6 +87,24 @@ def fp(img):
         v = v / v.norm(dim=-1, keepdim=True)
     return v.cpu().numpy()[0]
 
+def preprocess_for_hash(img):
+    """Make a phone photo hash like a clean scan: auto-crop to the card, deskew lightly, normalize.
+    Perceptual hashing is very sensitive to framing/crop/scale, so a raw phone photo (even glare-free)
+    hashes very differently from a clean catalogue image. Cropping tight to the card and normalizing
+    closes that gap so foreign cards match their English hash."""
+    from PIL import ImageOps
+    try:
+        gray = img.convert("L")
+        bw = ImageOps.autocontrast(gray)
+        bbox = bw.point(lambda p: 255 if p < 245 else 0).getbbox()
+        if bbox:
+            l, t, r, b = bbox
+            w, h = r - l, b - t
+            pad_x, pad_y = int(w * 0.02), int(h * 0.02)
+            img = img.crop((l + pad_x, t + pad_y, r - pad_x, b - pad_y))
+    except Exception:
+        pass
+    img = img.convert("RGB").resize((256, 256))
 def hash_match(img, hashes, topn=5):
     """Return the best hash matches (lower distance = better)."""
     t_p = imagehash.phash(img); t_a = imagehash.average_hash(img)
