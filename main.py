@@ -178,5 +178,7 @@ async def identify_foreign(file: UploadFile = File(...), number: str = Form(defa
     conf=False
     if best:
         gap=(top[0]["score"]-top[1]["score"]) if len(top)>1 else 0.2
-        conf = best["score"]>=0.40 and gap>=0.05
+        # Accept a clear winner: either a strong absolute score, or a decent score with a clear gap
+        # over 2nd place (a correct artwork match pulls ahead; wrong matches bunch together).
+        conf = (best["score"]>=0.42) or (best["score"]>=0.36 and gap>=0.06)
     return {"best":best if conf else None,"confident":conf,"narrowed":False,"stage":"full","matches":top}
