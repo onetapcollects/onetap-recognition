@@ -2,7 +2,7 @@ import os, io, json, urllib.request, requests
 import numpy as np
 import torch, open_clip
 import imagehash
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, UploadFile, File, Form
 
 # All five games in one service. CLIP loads once; each game's index loads into memory.
@@ -88,11 +88,10 @@ def fp(img):
     return v.cpu().numpy()[0]
 
 def preprocess_for_hash(img):
-    """Make a phone photo hash like a clean scan: auto-crop to the card, deskew lightly, normalize.
-    Perceptual hashing is very sensitive to framing/crop/scale, so a raw phone photo (even glare-free)
-    hashes very differently from a clean catalogue image. Cropping tight to the card and normalizing
-    closes that gap so foreign cards match their English hash."""
-    from PIL import ImageOps
+    """Make a phone photo hash like a clean scan: auto-crop to the card, normalize scale.
+    Perceptual hashing is very sensitive to framing/crop/scale, so a raw phone photo (even
+    glare-free) hashes very differently from a clean catalogue image. Cropping tight to the card
+    and normalizing to a fixed square closes that gap so foreign cards match their English hash."""
     try:
         gray = img.convert("L")
         bw = ImageOps.autocontrast(gray)
@@ -100,15 +99,19 @@ def preprocess_for_hash(img):
         if bbox:
             l, t, r, b = bbox
             w, h = r - l, b - t
-            pad_x, pad_y = int(w * 0.02), int(h * 0.02)
-            img = img.crop((l + pad_x, t + pad_y, r - pad_x, b - pad_y))
+            if w > 20 and h > 20:
+                pad_x, pad_y = int(w * 0.02), int(h * 0.02)
+                img = img.crop((l + pad_x, t + pad_y, r - pad_x, b - pad_y))
     except Exception:
         pass
-    img = img.convert("RGB").resize((256, 256))
+    return img.convert("RGB").resize((256, 256))
+
 def hash_match(img, hashes, topn=5):
-    """Return the best hash matches (lower distance = better)."""
-    t_p = imagehash.phash(img); t_a = imagehash.average_hash(img)
-    t_d = imagehash.dhash(img); t_w = imagehash.whash(img)
+    """Return the best hash matches (lower distance = better). The image is preprocessed (cropped
+    tight to the card + normalized) so a real phone photo hashes like the clean reference image."""
+    pimg = preprocess_for_hash(img)
+    t_p = imagehash.phash(pimg); t_a = imagehash.average_hash(pimg)
+    t_d = imagehash.dhash(pimg); t_w = imagehash.whash(pimg)
     scored = []
     for e in hashes:
         dist = (t_p - e["p"]) + (t_a - e["a"]) + (t_d - e["d"]) + (t_w - e["w"])
@@ -150,7 +153,6 @@ async def identify(file: UploadFile = File(...), game: str = Form(...)):
     hashes = data.get("hashes")
     if hashes:
         for dist, e in hash_match(img, hashes, topn=5):
-            # convert distance to a 0-1 confidence: dist 0 = 1.0, dist ~120 = 0
             conf = max(0.0, 1.0 - (dist / 120.0))
             hash_matches.append({
                 "name": e["name"], "number": e["number"], "set": e["set"],
@@ -158,13 +160,11 @@ async def identify(file: UploadFile = File(...), game: str = Form(...)):
             })
 
     # --- Fuse: if CLIP is confident, trust it; if CLIP is weak but hash is strong, prefer hash ---
-    # CLIP score is a cosine sim (higher better, ~0.8+ = confident). Hash conf is 0-1 (from distance).
     best = None
     if clip_matches:
         best = clip_matches[0]
     if hash_matches:
         h0 = hash_matches[0]
-        # if CLIP is weak (<0.75) and the hash match is strong (distance small / conf high), use hash
         if clip_top_score < 0.75 and h0["score"] > 0.80:
             best = h0
 
