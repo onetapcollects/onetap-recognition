@@ -14,7 +14,7 @@ from fastapi import FastAPI, UploadFile, File, Form
 
 DATA_DIR = "/data"
 RELEASE = "https://github.com/onetapcollects/onetap-recognition/releases/download/indexes"
-GAME_FILES = {"pokemon":"pokemon","magic":"magic","yugioh":"yugioh","one_piece":"onepiece","lorcana":"lorcana"}
+GAME_FILES = {"pokemon":"pokemon","magic":"magic","yugioh":"yugioh","one_piece":"onepiece","lorcana":"lorcana","star_wars":"starwars"}
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def ensure_file(fname):
