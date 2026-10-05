@@ -105,6 +105,32 @@ def fp(img):
         v = model.encode_image(x); v = v/v.norm(dim=-1, keepdim=True)
     return v.cpu().numpy()[0]
 
+# Best-effort crop to the card BEFORE CLIP encoding, so CLIP fingerprints the card art rather than the
+# background, hand or table around it (which drags a real phone photo's match down). Fully defensive:
+# it returns the ORIGINAL image whenever the detected crop looks implausible (whole frame = dark/busy
+# background where no crop happened, or a suspiciously tiny box), so it can NEVER make a scan worse than
+# the uncropped image. Same border-detection idea the hash path already uses, kept separate so the hash
+# tuning is untouched.
+def crop_to_card(img):
+    try:
+        gray = img.convert("L")
+        bw = ImageOps.autocontrast(gray)
+        bbox = bw.point(lambda p: 255 if p < 245 else 0).getbbox()
+        if not bbox:
+            return img
+        l, t, r, b = bbox
+        cw, ch = r - l, b - t
+        W, H = img.size
+        if cw < 40 or ch < 40:
+            return img  # too small to be a card -> keep the whole photo
+        area = (cw * ch) / float(max(W * H, 1))
+        if area < 0.25 or area > 0.985:
+            return img  # no real crop happened (dark bg) or implausible -> keep original
+        px, py = int(cw * 0.02), int(ch * 0.02)  # trim 2% to drop the border/edge glare
+        return img.crop((l + px, t + py, r - px, b - py))
+    except Exception:
+        return img
+
 def preprocess_for_hash(img):
     try:
         gray=img.convert("L"); bw=ImageOps.autocontrast(gray)
@@ -127,18 +153,31 @@ app = FastAPI()
 def health():
     return {"status":"ok","games":{g:{"cards":len(v["meta"]),"hashes":len(v.get("hashes",[]))} for g,v in INDEX.items()},"total":total,"foreign_loaded":FOREIGN["loaded"]}
 
+# Above this CLIP score the top match is already a confident, unambiguous win, so the hash second
+# signal is never needed: the service only promotes a hash match when CLIP is weak (ct<0.75 here, and
+# the app only consults the hash list when CLIP<0.82). Computing the hash loop anyway on a confident
+# English scan is pure wasted time — it's a Python pass over tens of thousands of cards. Skipping it
+# there makes the common case (a clear English card) noticeably faster with zero effect on accuracy.
+CLIP_CONFIDENT_SKIP_HASH = 0.85
+
 @app.post("/identify")
 async def identify(file: UploadFile = File(...), game: str = Form(...)):
     if game not in INDEX:
         return {"error":f"unknown game '{game}'","known":list(INDEX.keys())}
     data=INDEX[game]
-    img=Image.open(io.BytesIO(await file.read())).convert("RGB")
-    q=fp(img); sims=data["vectors"]@q
+    # exif_transpose: honour the photo's rotation flag so a sideways phone photo is encoded upright,
+    # not rotated — a rotated image matches far worse. No-op when there's no EXIF orientation.
+    img=ImageOps.exif_transpose(Image.open(io.BytesIO(await file.read()))).convert("RGB")
+    # CLIP fingerprints the cropped card (background/hand removed); the hash path keeps the full image,
+    # so its tuned behaviour is unchanged. crop_to_card falls back to the full image if the crop is iffy.
+    q=fp(crop_to_card(img)); sims=data["vectors"]@q
     order=sims.argsort()[::-1][:5]; m=data["meta"]
     ct=float(sims[order[0]]) if len(order) else 0.0
     clip=[{"name":m[i]["name"],"number":m[i].get("number"),"set":m[i].get("set"),"score":float(sims[i]),"source":"clip"} for i in order]
     hm=[]
-    if data.get("hashes"):
+    # Only spend time on the hash match when CLIP ISN'T already confident (weak CLIP = reprint/promo/
+    # foreign artwork, which is exactly where the hash signal earns its keep).
+    if data.get("hashes") and ct < CLIP_CONFIDENT_SKIP_HASH:
         for dist,e in hash_match(img,data["hashes"],5):
             hm.append({"name":e["name"],"number":e["number"],"set":e["set"],"distance":int(dist),"score":max(0.0,1.0-dist/120.0),"source":"hash"})
     best=clip[0] if clip else None
@@ -156,7 +195,7 @@ async def identify_foreign(file: UploadFile = File(...), number: str = Form(defa
     load_foreign()
     if not FOREIGN["loaded"]:
         return {"best":None,"confident":False,"error":"foreign unavailable"}
-    img=Image.open(io.BytesIO(await file.read())).convert("RGB")
+    img=ImageOps.exif_transpose(Image.open(io.BytesIO(await file.read()))).convert("RGB")
     q=_embed_foreign(img); qn=np.linalg.norm(q)+1e-9
     n=len(FOREIGN["meta"])
 
