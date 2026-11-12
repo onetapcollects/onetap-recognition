@@ -170,7 +170,7 @@ async def identify(file: UploadFile = File(...), game: str = Form(...)):
     img=ImageOps.exif_transpose(Image.open(io.BytesIO(await file.read()))).convert("RGB")
     # CLIP fingerprints the cropped card (background/hand removed); the hash path keeps the full image,
     # so its tuned behaviour is unchanged. crop_to_card falls back to the full image if the crop is iffy.
-    q=fp(crop_to_card(img)); sims=data["vectors"]@q
+    q=fp(img); sims=data["vectors"]@q
     order=sims.argsort()[::-1][:5]; m=data["meta"]
     ct=float(sims[order[0]]) if len(order) else 0.0
     clip=[{"name":m[i]["name"],"number":m[i].get("number"),"set":m[i].get("set"),"score":float(sims[i]),"source":"clip"} for i in order]
