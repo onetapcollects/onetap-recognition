@@ -1,4 +1,4 @@
-import os, io, json, requests
+import os, io, json, time, requests
 import numpy as np
 import torch, open_clip
 import imagehash
@@ -10,12 +10,22 @@ from fastapi import FastAPI, UploadFile, File, Form
 #  - English cards: CLIP fingerprints (+ hash second signal).
 #  - FOREIGN cards: a lightweight ONNX artwork embedder (the CollectorVision model, run directly via
 #    onnxruntime - no heavy package) matched against an English reference catalogue, NARROWED by the
-#    OCR-read collector number. Foreign-only. Catalogue loads lazily + as float16 to save memory.
+#    OCR-read collector number. Foreign-only.
+#
+# SPEED CHANGES (same results, no new data stored):
+#  - The four perceptual hashes per card are packed into 32 bytes at startup, so the hash match is a
+#    single numpy XOR + lookup over all cards instead of a Python loop over every card.
+#  - Top-5 picks use argpartition (only the best few are sorted), not a full sort of every card.
+#  - Foreign catalogue embeddings are normalised once at startup, so each scan is one matrix product.
+#  - Every response includes "ms" (server time), so we can see what a scan really costs.
 
 DATA_DIR = "/data"
 RELEASE = "https://github.com/onetapcollects/onetap-recognition/releases/download/indexes"
 GAME_FILES = {"pokemon":"pokemon","magic":"magic","yugioh":"yugioh","one_piece":"onepiece","lorcana":"lorcana","star_wars":"starwars"}
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Number of set bits in every byte value, used to count differing bits between two hashes.
+POP8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 def ensure_file(fname):
     path = os.path.join(DATA_DIR, fname)
@@ -30,6 +40,10 @@ def ensure_file(fname):
                 f.write(chunk)
     print(f"  saved {fname} ({os.path.getsize(path)} bytes)")
     return path
+
+def hash_bits(h1, h2, h3, h4):
+    """Pack the four 64-bit perceptual hashes into 32 bytes (same bits imagehash compares)."""
+    return np.packbits(np.concatenate([h1.hash.flatten(), h2.hash.flatten(), h3.hash.flatten(), h4.hash.flatten()]))
 
 print("Loading CLIP (CPU)...")
 model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
@@ -46,14 +60,16 @@ for cardType, stem in GAME_FILES.items():
         print(f"FAILED {cardType}: {e}"); continue
     try:
         raw = json.load(open(ensure_file(f"{stem}_hashes.json"), encoding="utf-8"))
-        hlist=[]
+        hlist=[]; bits=[]
         for h in raw:
             try:
-                hlist.append({"name":h.get("name"),"number":h.get("number"),"set":h.get("set"),
-                    "p":imagehash.hex_to_hash(h["phash"]),"a":imagehash.hex_to_hash(h["ahash"]),
-                    "d":imagehash.hex_to_hash(h["dhash"]),"w":imagehash.hex_to_hash(h["whash"])})
+                ph=imagehash.hex_to_hash(h["phash"]); ah=imagehash.hex_to_hash(h["ahash"])
+                dh=imagehash.hex_to_hash(h["dhash"]); wh=imagehash.hex_to_hash(h["whash"])
+                hlist.append({"name":h.get("name"),"number":h.get("number"),"set":h.get("set")})
+                bits.append(hash_bits(ph,ah,dh,wh))
             except Exception: pass
         entry["hashes"]=hlist
+        entry["hbits"]=np.stack(bits).astype(np.uint8) if bits else np.zeros((0,32),dtype=np.uint8)
         print(f"Loaded {cardType} hashes: {len(hlist)} cards.")
     except Exception as e:
         print(f"No hashes for {cardType}: {e}")
@@ -65,7 +81,7 @@ print(f"Ready: {len(INDEX)} games, {total} cards.")
 # ---- FOREIGN artwork embedder (CollectorVision's ONNX model, run directly) ----
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-FOREIGN = {"loaded":False,"embs":None,"meta":None,"norms":None,"num_index":None,"sess":None,"iname":None,"isize":448}
+FOREIGN = {"loaded":False,"unit":None,"meta":None,"num_index":None,"sess":None,"iname":None,"isize":448}
 def _digits(s):
     return "".join(ch for ch in str(s or "").split("/")[0] if ch.isdigit())
 def _prep(img, size):
@@ -88,13 +104,15 @@ def load_foreign():
         FOREIGN["iname"]=sess.get_inputs()[0].name
         FOREIGN["isize"]=sess.get_inputs()[0].shape[-1] if isinstance(sess.get_inputs()[0].shape[-1], int) else 448
         d = np.load(ensure_file("foreign_ref.npz"), allow_pickle=True)
-        embs = d["embeddings"].astype(np.float16)
+        embs = d["embeddings"].astype(np.float32)
         meta = json.load(open(ensure_file("foreign_ref_meta.json"), encoding="utf-8"))
-        norms = np.linalg.norm(embs.astype(np.float32), axis=1)+1e-9
+        norms = np.linalg.norm(embs, axis=1)+1e-9
+        unit = (embs / norms[:,None]).astype(np.float32)   # normalised once, so a scan is one matrix product
+        del embs
         ni={}
         for i,m in enumerate(meta):
             ni.setdefault(_digits(m.get("number")),[]).append(i)
-        FOREIGN.update({"loaded":True,"embs":embs,"meta":meta,"norms":norms,"num_index":ni})
+        FOREIGN.update({"loaded":True,"unit":unit,"meta":meta,"num_index":ni})
         print(f"Foreign catalogue loaded: {len(meta)} refs.")
     except Exception as e:
         print(f"Foreign load failed: {e}")
@@ -141,11 +159,24 @@ def preprocess_for_hash(img):
                 px,py=int(w*.02),int(h*.02); img=img.crop((l+px,t+py,r-px,b-py))
     except Exception: pass
     return img.convert("RGB").resize((256,256))
-def hash_match(img, hashes, topn=5):
+
+def top_k_idx(scores, k=5):
+    """Indexes of the k highest scores, best first. Only the top k are sorted, not every card."""
+    n = len(scores)
+    if n == 0:
+        return np.array([], dtype=np.int64)
+    k = min(k, n)
+    part = np.argpartition(-scores, k-1)[:k]
+    return part[np.argsort(-scores[part])]
+
+def hash_match(img, data, topn=5):
+    """Same scoring as before (total differing bits across the four hashes, lower is better),
+    done as one numpy pass over every card instead of a Python loop."""
     p=preprocess_for_hash(img)
-    tp,ta,td,tw=imagehash.phash(p),imagehash.average_hash(p),imagehash.dhash(p),imagehash.whash(p)
-    s=[((tp-e["p"])+(ta-e["a"])+(td-e["d"])+(tw-e["w"]),e) for e in hashes]
-    s.sort(key=lambda x:x[0]); return s[:topn]
+    qb=hash_bits(imagehash.phash(p),imagehash.average_hash(p),imagehash.dhash(p),imagehash.whash(p))
+    dist=POP8[data["hbits"] ^ qb].sum(axis=1, dtype=np.int32)
+    idx=top_k_idx(-dist.astype(np.float32), topn)
+    return [(int(dist[i]), data["hashes"][i]) for i in idx]
 
 app = FastAPI()
 
@@ -155,13 +186,13 @@ def health():
 
 # Above this CLIP score the top match is already a confident, unambiguous win, so the hash second
 # signal is never needed: the service only promotes a hash match when CLIP is weak (ct<0.75 here, and
-# the app only consults the hash list when CLIP<0.82). Computing the hash loop anyway on a confident
-# English scan is pure wasted time — it's a Python pass over tens of thousands of cards. Skipping it
-# there makes the common case (a clear English card) noticeably faster with zero effect on accuracy.
+# the app only consults the hash list when CLIP<0.82). Skipping the hash pass on a confident English
+# scan makes the common case faster with zero effect on accuracy.
 CLIP_CONFIDENT_SKIP_HASH = 0.85
 
 @app.post("/identify")
 async def identify(file: UploadFile = File(...), game: str = Form(...)):
+    t0=time.perf_counter()
     if game not in INDEX:
         return {"error":f"unknown game '{game}'","known":list(INDEX.keys())}
     data=INDEX[game]
@@ -171,27 +202,37 @@ async def identify(file: UploadFile = File(...), game: str = Form(...)):
     # CLIP fingerprints the cropped card (background/hand removed); the hash path keeps the full image,
     # so its tuned behaviour is unchanged. crop_to_card falls back to the full image if the crop is iffy.
     q=fp(crop_to_card(img)); sims=data["vectors"]@q
-    order=sims.argsort()[::-1][:5]; m=data["meta"]
+    order=top_k_idx(sims, 5); m=data["meta"]
     ct=float(sims[order[0]]) if len(order) else 0.0
     clip=[{"name":m[i]["name"],"number":m[i].get("number"),"set":m[i].get("set"),"score":float(sims[i]),"source":"clip"} for i in order]
     hm=[]
     # Only spend time on the hash match when CLIP ISN'T already confident (weak CLIP = reprint/promo/
     # foreign artwork, which is exactly where the hash signal earns its keep).
     if data.get("hashes") and ct < CLIP_CONFIDENT_SKIP_HASH:
-        for dist,e in hash_match(img,data["hashes"],5):
+        for dist,e in hash_match(img,data,5):
             hm.append({"name":e["name"],"number":e["number"],"set":e["set"],"distance":int(dist),"score":max(0.0,1.0-dist/120.0),"source":"hash"})
     best=clip[0] if clip else None
     if hm and ct<0.75 and hm[0]["score"]>0.80: best=hm[0]
-    return {"game":game,"best":best,"clip":clip,"hash":hm}
+    return {"game":game,"best":best,"clip":clip,"hash":hm,"ms":round((time.perf_counter()-t0)*1000)}
 
-def _score_pool(q, qn, idxs):
-    embs=FOREIGN["embs"]; norms=FOREIGN["norms"]; meta=FOREIGN["meta"]
-    sims=[(float(np.dot(embs[i].astype(np.float32),q)/(norms[i]*qn)),i) for i in idxs]
-    sims.sort(reverse=True)
-    return [{"name":meta[i].get("name"),"set":meta[i].get("set"),"number":meta[i].get("number"),"score":round(s,4)} for s,i in sims[:5]]
+def _score_pool(q, qn, idxs=None):
+    """Cosine score of the query against the catalogue (all cards, or only the indexes in idxs)."""
+    unit=FOREIGN["unit"]; meta=FOREIGN["meta"]
+    qv=(q/qn).astype(np.float32)
+    if idxs is None:
+        idx=None; s=unit @ qv
+    else:
+        idx=np.asarray(idxs, dtype=np.int64); s=unit[idx] @ qv
+    top=top_k_idx(s, 5)
+    out=[]
+    for p in top:
+        gi = int(idx[p]) if idx is not None else int(p)
+        out.append({"name":meta[gi].get("name"),"set":meta[gi].get("set"),"number":meta[gi].get("number"),"score":round(float(s[p]),4)})
+    return out
 
 @app.post("/identify_foreign")
 async def identify_foreign(file: UploadFile = File(...), number: str = Form(default="")):
+    t0=time.perf_counter()
     load_foreign()
     if not FOREIGN["loaded"]:
         return {"best":None,"confident":False,"error":"foreign unavailable"}
@@ -208,11 +249,11 @@ async def identify_foreign(file: UploadFile = File(...), number: str = Form(defa
         if best:
             gap=(top[0]["score"]-top[1]["score"]) if len(top)>1 else 0.2
             if best["score"]>=0.32 and gap>=0.03:
-                return {"best":best,"confident":True,"narrowed":True,"stage":"number","matches":top}
+                return {"best":best,"confident":True,"narrowed":True,"stage":"number","matches":top,"ms":round((time.perf_counter()-t0)*1000)}
 
     # STAGE 2: number narrow missed (JP number != EN catalogue number). Full artwork search.
     # Higher bar since there's no number filter: needs a clear win to be trusted.
-    top=_score_pool(q, qn, list(range(n)))
+    top=_score_pool(q, qn, None)
     best=top[0] if top else None
     conf=False
     if best:
@@ -220,4 +261,4 @@ async def identify_foreign(file: UploadFile = File(...), number: str = Form(defa
         # Accept a clear winner: either a strong absolute score, or a decent score with a clear gap
         # over 2nd place (a correct artwork match pulls ahead; wrong matches bunch together).
         conf = (best["score"]>=0.42) or (best["score"]>=0.36 and gap>=0.06)
-    return {"best":best if conf else None,"confident":conf,"narrowed":False,"stage":"full","matches":top}
+    return {"best":best if conf else None,"confident":conf,"narrowed":False,"stage":"full","matches":top,"ms":round((time.perf_counter()-t0)*1000)}
